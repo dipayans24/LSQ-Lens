@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-#  LeadSquared Field Fetcher  –  Streamlit app
+#  LeadSquared Lens  –  Streamlit app
 # ══════════════════════════════════════════════════════════════════════════════
 #  Install :  pip install -r requirements.txt
 #  Run     :  streamlit run lsq_field_fetcher.py
@@ -42,14 +42,12 @@ BACKOFF_BASE = 1.5                                  # first retry waits ~1.5 s, 
 RATE_LIMIT_CALLS = 30                               # LeadSquared allows at most 30 API calls …
 RATE_LIMIT_WINDOW = 5.0                             # … in any rolling 5-second window
 SEARCH_KEYS = ["Prospect ID", "Email Address", "Phone Number"]  # keys we can search leads by
-NONE_LABEL = "— none —"                             # label used for "no fallback key"
 AUTH_HINTS = ("invalid credential", "invalid access", "invalid secret",
               "unauthorized", "authentication")     # words in an error body that mean "bad keys"
 
 # ── Activity event filter (label -> LeadSquared activity event code) ──────────
-# Add more rows as you need them. None means "do not filter, use every activity".
+# Add more rows as you need them. Selecting none of them in the UI means "use every activity".
 ACTIVITY_EVENTS = {
-    "All activities": None,                         # no filter
     "Payment Received": 204,                        # event code taken from your original script
 }
 
@@ -580,15 +578,17 @@ class LsqClient:
             return None
         return flatten_lead(data)                   # normalise the layout
 
-    def get_activities(self, lead_id: str, event_code):
-        """Fetch a lead's activities (optionally only one event type) as flat dicts."""
-        payload = {"ActivityEvent": event_code} if event_code else {}  # same payload as your script
-        data = self._request("POST", "/v2/ProspectActivity.svc/Retrieve",
-                             {"leadId": lead_id}, payload)
-        return extract_activities(data)             # list of flat dicts (may be empty)
+    def get_activities(self, lead_id: str, event_codes):
+        """Fetch a lead's activities as flat dicts – one call per selected event type (none = all)."""
+        activities = []                             # merged result across event types
+        for code in (event_codes or [None]):        # no selection -> a single unfiltered call
+            payload = {"ActivityEvent": code} if code else {}  # same payload as your script
+            data = self._request("POST", "/v2/ProspectActivity.svc/Retrieve",
+                                 {"leadId": lead_id}, payload)
+            activities.extend(extract_activities(data))  # add this event type's activities
+        return activities                           # list of flat dicts (may be empty)
 
-
-def fetch_values(client, key_type, value, specs, mode, event_code, pick_mode, keep_raw=False):
+def fetch_values(client, key_type, value, specs, mode, event_codes, pick_mode, keep_raw=False):
     """Look up ONE key and return ({label: value} or None if not found, raw response or None).
 
     specs = [(display label, API field name), …]   mode = "Lead" or "Activity"
@@ -611,7 +611,7 @@ def fetch_values(client, key_type, value, specs, mode, event_code, pick_mode, ke
         lead_id = clean(lead.get("prospectid")) if lead else ""
     if not lead_id:                                 # could not identify the lead
         return None, None
-    activities = client.get_activities(lead_id, event_code)  # activities for that lead
+    activities = client.get_activities(lead_id, event_codes)  # activities for that lead
     if not activities:                              # lead has no (matching) activities
         return None, None
     values = pick_activity_values(activities, specs, pick_mode)  # choose values per field
@@ -624,10 +624,10 @@ def fetch_values(client, key_type, value, specs, mode, event_code, pick_mode, ke
 # ══════════════════════════════════════════════════════════════════════════════
 #  4. Batch engine (threads do the HTTP, the main thread draws the progress bar)
 # ══════════════════════════════════════════════════════════════════════════════
-def _worker(client, key_type, value, specs, mode, event_code, pick_mode):
+def _worker(client, key_type, value, specs, mode, event_codes, pick_mode):
     """Runs inside a worker thread. Must NOT call any st.* function."""
     try:
-        found, _ = fetch_values(client, key_type, value, specs, mode, event_code, pick_mode)
+        found, _ = fetch_values(client, key_type, value, specs, mode, event_codes, pick_mode)
         return value, "ok", found                   # success (found may be None = not found)
     except AuthError as exc:                        # bad credentials -> abort the whole run
         return value, "auth", str(exc)
@@ -635,7 +635,7 @@ def _worker(client, key_type, value, specs, mode, event_code, pick_mode):
         return value, "error", str(exc)
 
 
-def run_batch(df, plan, specs, mode, event_code, pick_mode, client, workers, progress=stqdm):
+def run_batch(df, plan, specs, mode, event_codes, pick_mode, client, workers, progress=stqdm):
     """Fetch the requested fields for every row of df.
 
     plan = [(key type, column name), …] in priority order (1st, 2nd, 3rd …).
@@ -656,7 +656,7 @@ def run_batch(df, plan, specs, mode, event_code, pick_mode, client, workers, pro
         todo = sorted({keys[i] for i in pending if (key_type, keys[i]) not in cache})  # unique, new keys
         if todo:                                    # skip the network entirely if nothing to look up
             with ThreadPoolExecutor(max_workers=workers) as pool:  # the thread pool
-                futures = [pool.submit(_worker, client, key_type, k, specs, mode, event_code, pick_mode)
+                futures = [pool.submit(_worker, client, key_type, k, specs, mode, event_codes, pick_mode)
                            for k in todo]           # queue one task per unique key
                 for future in progress(as_completed(futures), total=len(futures),
                                        desc=f"Looking up by {key_type}"):  # stqdm bar, updated as tasks finish
@@ -738,24 +738,6 @@ def guess_column(columns, key_type: str) -> int:
     return 0                                        # nothing matched -> first column
 
 
-def add_field(state_key: str, pick_key: str) -> None:
-    """Callback: move the field chosen in the selectbox into the selected list."""
-    choice = st.session_state.get(pick_key)         # label currently picked (None if empty)
-    if choice and choice not in st.session_state[state_key]:  # ignore blanks and duplicates
-        st.session_state[state_key].append(choice)  # remember it
-    st.session_state[pick_key] = None               # reset the selectbox for the next pick
-
-
-def remove_field(state_key: str, label: str) -> None:
-    """Callback: drop one field from the selected list."""
-    st.session_state[state_key] = [x for x in st.session_state[state_key] if x != label]
-
-
-def clear_fields(state_key: str) -> None:
-    """Callback: empty the selected list."""
-    st.session_state[state_key] = []
-
-
 def render_credentials_builder() -> None:
     """Panel for creating + downloading the credentials JSON."""
     st.subheader("Create a credentials file")
@@ -772,43 +754,42 @@ def render_credentials_builder() -> None:
                "never commit it to Git.")
 
 
+def sticky_multiselect(label, options, key, default=None, **kwargs):
+    """st.multiselect that remembers its picks even while hidden (Streamlit forgets hidden widgets)."""
+    saved = st.session_state.get(f"_saved_{key}", default or [])  # last picks, else the default
+    saved = [x for x in saved if x in options]      # drop anything that is no longer an option
+    chosen = st.multiselect(label, options, default=saved, key=key, **kwargs)  # the real widget
+    st.session_state[f"_saved_{key}"] = chosen      # remember for when the widget is shown again
+    return chosen
+
+
 def choose_fields(mode: str, field_map: dict) -> list:
-    """Selectbox + 'Add' button that builds up the list of fields to fetch. Returns [(label, api)]."""
-    state_key, pick_key = f"selected_{mode}", f"pick_{mode}"  # separate lists for Lead / Activity
-    st.session_state.setdefault(state_key, [])      # create the list on first run
-    st.session_state[state_key] = [x for x in st.session_state[state_key] if x in field_map]  # drop stale
-    left, right = st.columns([5, 1], vertical_alignment="bottom")  # selectbox + button side by side
-    left.selectbox(f"{mode} field (type to search)", list(field_map.keys()), index=None,
-                   placeholder="Choose a field…", key=pick_key)  # one field at a time
-    right.button("➕ Add", key=f"add_{mode}", on_click=add_field, args=(state_key, pick_key),
-                 use_container_width=True)          # appends the chosen field
-    selected = st.session_state[state_key]          # what has been added so far
-    if selected:                                    # show each field with a remove button
-        for label in selected:
-            c1, c2 = st.columns([8, 1])             # text + ✖ button
-            c1.markdown(f"• **{label}**  <small>→ `{field_map[label]}`</small>", unsafe_allow_html=True)
-            c2.button("✖", key=f"rm_{mode}_{label}", on_click=remove_field, args=(state_key, label))
-        st.button("Clear all fields", key=f"clear_{mode}", on_click=clear_fields, args=(state_key,))
+    """Multiselect for the fields to fetch. Returns [(display label, API field name)]."""
+    chosen = sticky_multiselect(f"{mode} fields to fetch (type to search)", list(field_map.keys()),
+                            key=f"selected_{mode}", placeholder="Choose one or more fields…")  # separate state per mode
+    if chosen:                                      # show the API name behind each label
+        st.caption("  ·  ".join(f"{label} → `{field_map[label]}`" for label in chosen))
     else:
-        st.info("Add at least one field to fetch.")  # gentle nudge
-    return [(label, field_map[label]) for label in selected]  # (display label, API name) pairs
+        st.info("Select at least one field to fetch.")  # gentle nudge
+    return [(label, field_map[label]) for label in chosen]  # (display label, API name) pairs
 
 
 def choose_key_plan(columns) -> list:
-    """Ask for the search key (+ optional fallbacks) and the file column for each. Returns the plan."""
-    primary = st.selectbox("Search key", SEARCH_KEYS, key="primary_key")  # 1st priority key
-    plan = [(primary, st.selectbox(f"File column holding the {primary}", columns,
-                                   index=guess_column(columns, primary), key=f"col_{primary}"))]
-    if not st.checkbox("Use fallback keys when a value is blank or not found", key="use_fallback"):
-        return plan                                 # single-key search
-    remaining = [k for k in SEARCH_KEYS if k != primary]  # keys not used yet
-    for rank in ("2nd", "3rd"):                     # up to two extra keys
-        choice = st.selectbox(f"{rank} priority key", [NONE_LABEL] + remaining, key=f"fallback_{rank}")
-        if choice == NONE_LABEL:                    # user stopped the chain
-            break
-        plan.append((choice, st.selectbox(f"File column holding the {choice}", columns,
-                                          index=guess_column(columns, choice), key=f"col_{choice}")))
-        remaining = [k for k in remaining if k != choice]  # cannot pick the same key twice
+    """Multiselect for the search key(s) + a column picker per key. Returns [(key type, column)]."""
+    keys = sticky_multiselect("Search keys – the order you select them is the lookup priority",
+                          SEARCH_KEYS, default=[SEARCH_KEYS[0]], key="search_keys",
+                          help="Pick one key for a normal search. Pick several to use the later ones as "
+                               "fallbacks for rows that are still blank after the earlier ones.")
+    if not keys:                                    # nothing chosen -> nothing to search by
+        st.info("Select at least one search key.")
+        return []
+    if len(keys) > 1:                               # make the priority order visible
+        st.caption("Priority:  " + "  →  ".join(f"{i}. {k}" for i, k in enumerate(keys, start=1)))
+    plan = []                                       # [(key type, file column)]
+    for key_type in keys:                           # one column mapping per chosen key (a key maps to ONE column)
+        column = st.selectbox(f"File column holding the {key_type}", columns,
+                              index=guess_column(columns, key_type), key=f"col_{key_type}")
+        plan.append((key_type, column))
     return plan
 
 
@@ -849,12 +830,13 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
     mode = "Activity" if use_activity else "Lead"   # which mode we are in
     field_map = ACTIVITY_FIELDS if use_activity else LEAD_FIELDS  # matching dictionary
 
-    event_code, pick_mode = None, PICK_LATEST       # defaults (unused in Lead mode)
+    event_codes, pick_mode = [], PICK_LATEST        # defaults (unused in Lead mode)
     if use_activity:                                # extra options only Activity mode needs
         c1, c2 = st.columns(2)
-        event_label = c1.selectbox("Activity type", list(ACTIVITY_EVENTS.keys()))  # filter by event
-        event_code = ACTIVITY_EVENTS[event_label]   # None means "all"
-        pick_mode = c2.selectbox("If a lead has several matching activities", PICK_MODES)
+        event_labels = sticky_multiselect("Activity types (leave empty for all)", list(ACTIVITY_EVENTS.keys()),
+                                      key="event_types")  # one API call per selected type
+        event_codes = [ACTIVITY_EVENTS[label] for label in event_labels]  # labels -> event codes
+        pick_mode = c2.selectbox("If a lead has several matching activities", PICK_MODES)  # single choice
 
     specs = choose_fields(mode, field_map)          # [(label, api name), …]
     st.divider()
@@ -869,7 +851,7 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
             search = normalise_key(key_type, value)  # tidy the input
             try:
                 with st.spinner("Contacting LeadSquared…"):
-                    found, raw = fetch_values(client, key_type, search, specs, mode, event_code,
+                    found, raw = fetch_values(client, key_type, search, specs, mode, event_codes,
                                               pick_mode, keep_raw=show_raw)
             except AuthError as exc:                # wrong keys
                 st.error(str(exc))
@@ -904,10 +886,10 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
             st.dataframe(df.head(10), use_container_width=True)
         plan = choose_key_plan(list(df.columns))    # [(key type, column), …]
         include_all = st.checkbox("Keep all original columns in the output", value=False)
-        if st.button("🚀 Fetch fields", type="primary", disabled=not (creds and specs)):
+        if st.button("🚀 Fetch fields", type="primary", disabled=not (creds and specs and plan)):
             client = LsqClient(creds, max_calls)      # fresh counters for this run
             try:
-                values, matched, stats = run_batch(df, plan, specs, mode, event_code, pick_mode,
+                values, matched, stats = run_batch(df, plan, specs, mode, event_codes, pick_mode,
                                                    client, workers)  # the parallel part
             except AuthError as exc:                # stop early on bad keys
                 st.error(f"{exc} Check your credentials file and host.")
