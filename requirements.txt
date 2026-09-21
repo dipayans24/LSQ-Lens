@@ -1,0 +1,5 @@
+streamlit>=1.36
+stqdm
+pandas
+requests
+openpyxl
