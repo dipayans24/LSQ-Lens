@@ -925,8 +925,8 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
 #  7. App entry point
 # ══════════════════════════════════════════════════════════════════════════════
 def main() -> None:
-    st.set_page_config(page_title="LeadSquared Field Fetcher", page_icon="🔎", layout="wide")
-    st.title("🔎 LeadSquared Field Fetcher")
+    st.set_page_config(page_title="LeadSquared Lens", page_icon="🔎", layout="wide")
+    st.title("🔎 LeadSquared Lens")
 
     with st.sidebar:                                # connection + performance settings
         st.header("🔐 Connection")
