@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# LSQ Lens  –  Streamlit app
+#  LSQ Lens  –  Streamlit app
 # ══════════════════════════════════════════════════════════════════════════════
 #  Install :  pip install -r requirements.txt
 #  Run     :  streamlit run lsq_field_fetcher.py
@@ -307,6 +307,14 @@ LEAD_FIELDS = {
     "DVL Product": "mx_DVL_Product",
 }
 
+
+# Event names to filter Activity mode by – matches the "eventname" field LeadSquared returns on
+# each activity (e.g. "LeadAssigned", "StageChange", "Lead owner change", "WhatsApp Message" …).
+# Leave the multiselect empty in the UI to fetch every event type. Add more strings as you need them.
+ACTIVITY_EVENT_NAMES = [
+    "LeadAssigned",
+]
+
 ACTIVITY_FIELDS = {
     "Prospect Id": "ProspectID",
     "Email Address": "EmailAddress",
@@ -577,7 +585,7 @@ class LsqClient:
         data = self._request("POST", "/v2/ProspectActivity.svc/Retrieve", {"leadId": lead_id}, {})
         return extract_activities(data)             # list of flat dicts (may be empty)
 
-def fetch_values(client, key_type, value, specs, mode, pick_mode, keep_raw=False):
+def fetch_values(client, key_type, value, specs, mode, pick_mode, event_names=(), keep_raw=False):
     """Look up ONE key and return ({label: value} or None if not found, raw response or None).
 
     specs = [(display label, API field name), …]   mode = "Lead" or "Activity"
@@ -600,7 +608,9 @@ def fetch_values(client, key_type, value, specs, mode, pick_mode, keep_raw=False
         lead_id = clean(lead.get("prospectid")) if lead else ""
     if not lead_id:                                 # could not identify the lead
         return None, None
-    activities = client.get_activities(lead_id)  # activities for that lead
+    activities = client.get_activities(lead_id)  # every activity for that lead
+    if event_names:                                 # keep only the selected event type(s)
+        activities = [a for a in activities if a.get("eventname") in event_names]
     if not activities:                              # lead has no (matching) activities
         return None, None
     values = pick_activity_values(activities, specs, pick_mode)  # choose values per field
@@ -613,10 +623,10 @@ def fetch_values(client, key_type, value, specs, mode, pick_mode, keep_raw=False
 # ══════════════════════════════════════════════════════════════════════════════
 #  4. Batch engine (threads do the HTTP, the main thread draws the progress bar)
 # ══════════════════════════════════════════════════════════════════════════════
-def _worker(client, key_type, value, specs, mode, pick_mode):
+def _worker(client, key_type, value, specs, mode, pick_mode, event_names):
     """Runs inside a worker thread. Must NOT call any st.* function."""
     try:
-        found, _ = fetch_values(client, key_type, value, specs, mode, pick_mode)
+        found, _ = fetch_values(client, key_type, value, specs, mode, pick_mode, event_names)
         return value, "ok", found                   # success (found may be None = not found)
     except AuthError as exc:                        # bad credentials -> abort the whole run
         return value, "auth", str(exc)
@@ -624,7 +634,7 @@ def _worker(client, key_type, value, specs, mode, pick_mode):
         return value, "error", str(exc)
 
 
-def run_batch(df, plan, specs, mode, pick_mode, client, workers, progress=stqdm):
+def run_batch(df, plan, specs, mode, pick_mode, client, workers, event_names=(), progress=stqdm):
     """Fetch the requested fields for every row of df.
 
     plan = [(key type, column name), …] in priority order (1st, 2nd, 3rd …).
@@ -645,7 +655,7 @@ def run_batch(df, plan, specs, mode, pick_mode, client, workers, progress=stqdm)
         todo = sorted({keys[i] for i in pending if (key_type, keys[i]) not in cache})  # unique, new keys
         if todo:                                    # skip the network entirely if nothing to look up
             with ThreadPoolExecutor(max_workers=workers) as pool:  # the thread pool
-                futures = [pool.submit(_worker, client, key_type, k, specs, mode, pick_mode)
+                futures = [pool.submit(_worker, client, key_type, k, specs, mode, pick_mode, event_names)
                            for k in todo]           # queue one task per unique key
                 for future in progress(as_completed(futures), total=len(futures),
                                        desc=f"Looking up by {key_type}"):  # stqdm bar, updated as tasks finish
@@ -820,8 +830,10 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
     mode = "Activity" if use_activity else "Lead"   # which mode we are in
     field_map = ACTIVITY_FIELDS if use_activity else LEAD_FIELDS  # matching dictionary
 
-    pick_mode = PICK_LATEST                          # default (unused in Lead mode)
-    if use_activity:                                # extra option only Activity mode needs
+    pick_mode, event_names = PICK_LATEST, []         # defaults (unused in Lead mode)
+    if use_activity:                                # extra options only Activity mode needs
+        event_names = st.multiselect("Activity event name (leave empty for all)",
+                                     ACTIVITY_EVENT_NAMES, key="event_names")  # filters after fetching
         pick_mode = st.selectbox("If a lead has several matching activities, use the",
                                  PICK_MODES)         # full-width, so it lines up with the widgets around it
 
@@ -839,7 +851,7 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
             try:
                 with st.spinner("Contacting LeadSquared…"):
                     found, raw = fetch_values(client, key_type, search, specs, mode,
-                                              pick_mode, keep_raw=show_raw)
+                                              pick_mode, event_names, keep_raw=show_raw)
             except AuthError as exc:                # wrong keys
                 st.error(str(exc))
                 return
@@ -877,7 +889,7 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
             client = LsqClient(creds, max_calls)      # fresh counters for this run
             try:
                 values, matched, stats = run_batch(df, plan, specs, mode, pick_mode,
-                                                   client, workers)  # the parallel part
+                                                   client, workers, event_names)  # the parallel part
             except AuthError as exc:                # stop early on bad keys
                 st.error(f"{exc} Check your credentials file and host.")
                 return
@@ -894,8 +906,8 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
 #  7. App entry point
 # ══════════════════════════════════════════════════════════════════════════════
 def main() -> None:
-    st.set_page_config(page_title="LeadSquared Field Fetcher", page_icon="🔎", layout="wide")
-    st.title("🔎LSQ Lens")
+    st.set_page_config(page_title="LSQ Lens", page_icon="🔎", layout="wide")
+    st.title("🔎 LSQ Lens")
 
     with st.sidebar:                                # connection + performance settings
         st.header("🔐 Connection")
