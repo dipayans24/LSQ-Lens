@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-#  LeadSquared Lens  –  Streamlit app
+#  LeadSquared Field Fetcher  –  Streamlit app
 # ══════════════════════════════════════════════════════════════════════════════
 #  Install :  pip install -r requirements.txt
 #  Run     :  streamlit run lsq_field_fetcher.py
@@ -44,12 +44,6 @@ RATE_LIMIT_WINDOW = 5.0                             # … in any rolling 5-secon
 SEARCH_KEYS = ["Prospect ID", "Email Address", "Phone Number"]  # keys we can search leads by
 AUTH_HINTS = ("invalid credential", "invalid access", "invalid secret",
               "unauthorized", "authentication")     # words in an error body that mean "bad keys"
-
-# ── Activity event filter (label -> LeadSquared activity event code) ──────────
-# Add more rows as you need them. Selecting none of them in the UI means "use every activity".
-ACTIVITY_EVENTS = {
-    "Payment Received": 204,                        # event code taken from your original script
-}
 
 # ── How to pick a value when a lead has several activities ────────────────────
 PICK_LATEST = "Latest non-blank value"              # newest activity that has a value
@@ -578,17 +572,12 @@ class LsqClient:
             return None
         return flatten_lead(data)                   # normalise the layout
 
-    def get_activities(self, lead_id: str, event_codes):
-        """Fetch a lead's activities as flat dicts – one call per selected event type (none = all)."""
-        activities = []                             # merged result across event types
-        for code in (event_codes or [None]):        # no selection -> a single unfiltered call
-            payload = {"ActivityEvent": code} if code else {}  # same payload as your script
-            data = self._request("POST", "/v2/ProspectActivity.svc/Retrieve",
-                                 {"leadId": lead_id}, payload)
-            activities.extend(extract_activities(data))  # add this event type's activities
-        return activities                           # list of flat dicts (may be empty)
+    def get_activities(self, lead_id: str):
+        """Fetch every activity for a lead, as a list of flat dicts."""
+        data = self._request("POST", "/v2/ProspectActivity.svc/Retrieve", {"leadId": lead_id}, {})
+        return extract_activities(data)             # list of flat dicts (may be empty)
 
-def fetch_values(client, key_type, value, specs, mode, event_codes, pick_mode, keep_raw=False):
+def fetch_values(client, key_type, value, specs, mode, pick_mode, keep_raw=False):
     """Look up ONE key and return ({label: value} or None if not found, raw response or None).
 
     specs = [(display label, API field name), …]   mode = "Lead" or "Activity"
@@ -611,7 +600,7 @@ def fetch_values(client, key_type, value, specs, mode, event_codes, pick_mode, k
         lead_id = clean(lead.get("prospectid")) if lead else ""
     if not lead_id:                                 # could not identify the lead
         return None, None
-    activities = client.get_activities(lead_id, event_codes)  # activities for that lead
+    activities = client.get_activities(lead_id)  # activities for that lead
     if not activities:                              # lead has no (matching) activities
         return None, None
     values = pick_activity_values(activities, specs, pick_mode)  # choose values per field
@@ -624,10 +613,10 @@ def fetch_values(client, key_type, value, specs, mode, event_codes, pick_mode, k
 # ══════════════════════════════════════════════════════════════════════════════
 #  4. Batch engine (threads do the HTTP, the main thread draws the progress bar)
 # ══════════════════════════════════════════════════════════════════════════════
-def _worker(client, key_type, value, specs, mode, event_codes, pick_mode):
+def _worker(client, key_type, value, specs, mode, pick_mode):
     """Runs inside a worker thread. Must NOT call any st.* function."""
     try:
-        found, _ = fetch_values(client, key_type, value, specs, mode, event_codes, pick_mode)
+        found, _ = fetch_values(client, key_type, value, specs, mode, pick_mode)
         return value, "ok", found                   # success (found may be None = not found)
     except AuthError as exc:                        # bad credentials -> abort the whole run
         return value, "auth", str(exc)
@@ -635,7 +624,7 @@ def _worker(client, key_type, value, specs, mode, event_codes, pick_mode):
         return value, "error", str(exc)
 
 
-def run_batch(df, plan, specs, mode, event_codes, pick_mode, client, workers, progress=stqdm):
+def run_batch(df, plan, specs, mode, pick_mode, client, workers, progress=stqdm):
     """Fetch the requested fields for every row of df.
 
     plan = [(key type, column name), …] in priority order (1st, 2nd, 3rd …).
@@ -656,7 +645,7 @@ def run_batch(df, plan, specs, mode, event_codes, pick_mode, client, workers, pr
         todo = sorted({keys[i] for i in pending if (key_type, keys[i]) not in cache})  # unique, new keys
         if todo:                                    # skip the network entirely if nothing to look up
             with ThreadPoolExecutor(max_workers=workers) as pool:  # the thread pool
-                futures = [pool.submit(_worker, client, key_type, k, specs, mode, event_codes, pick_mode)
+                futures = [pool.submit(_worker, client, key_type, k, specs, mode, pick_mode)
                            for k in todo]           # queue one task per unique key
                 for future in progress(as_completed(futures), total=len(futures),
                                        desc=f"Looking up by {key_type}"):  # stqdm bar, updated as tasks finish
@@ -776,10 +765,11 @@ def choose_fields(mode: str, field_map: dict) -> list:
 
 def choose_key_plan(columns) -> list:
     """Multiselect for the search key(s) + a column picker per key. Returns [(key type, column)]."""
-    keys = sticky_multiselect("Search keys – the order you select them is the lookup priority",
-                          SEARCH_KEYS, default=[SEARCH_KEYS[0]], key="search_keys",
-                          help="Pick one key for a normal search. Pick several to use the later ones as "
-                               "fallbacks for rows that are still blank after the earlier ones.")
+    keys = st.multiselect("Search key(s) – pick any combination of Prospect ID, Email Address and "
+                          "Phone Number", SEARCH_KEYS, default=[SEARCH_KEYS[0]], key="search_keys",
+                          help="Pick one key for a normal search. Pick several to use the later ones "
+                               "(in the order you pick them) as fallbacks for rows still blank after "
+                               "the earlier ones.")
     if not keys:                                    # nothing chosen -> nothing to search by
         st.info("Select at least one search key.")
         return []
@@ -830,13 +820,10 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
     mode = "Activity" if use_activity else "Lead"   # which mode we are in
     field_map = ACTIVITY_FIELDS if use_activity else LEAD_FIELDS  # matching dictionary
 
-    event_codes, pick_mode = [], PICK_LATEST        # defaults (unused in Lead mode)
-    if use_activity:                                # extra options only Activity mode needs
-        c1, c2 = st.columns(2)
-        event_labels = sticky_multiselect("Activity types (leave empty for all)", list(ACTIVITY_EVENTS.keys()),
-                                      key="event_types")  # one API call per selected type
-        event_codes = [ACTIVITY_EVENTS[label] for label in event_labels]  # labels -> event codes
-        pick_mode = c2.selectbox("If a lead has several matching activities", PICK_MODES)  # single choice
+    pick_mode = PICK_LATEST                          # default (unused in Lead mode)
+    if use_activity:                                # extra option only Activity mode needs
+        pick_mode = st.selectbox("If a lead has several matching activities, use the",
+                                 PICK_MODES)         # full-width, so it lines up with the widgets around it
 
     specs = choose_fields(mode, field_map)          # [(label, api name), …]
     st.divider()
@@ -851,7 +838,7 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
             search = normalise_key(key_type, value)  # tidy the input
             try:
                 with st.spinner("Contacting LeadSquared…"):
-                    found, raw = fetch_values(client, key_type, search, specs, mode, event_codes,
+                    found, raw = fetch_values(client, key_type, search, specs, mode,
                                               pick_mode, keep_raw=show_raw)
             except AuthError as exc:                # wrong keys
                 st.error(str(exc))
@@ -889,7 +876,7 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
         if st.button("🚀 Fetch fields", type="primary", disabled=not (creds and specs and plan)):
             client = LsqClient(creds, max_calls)      # fresh counters for this run
             try:
-                values, matched, stats = run_batch(df, plan, specs, mode, event_codes, pick_mode,
+                values, matched, stats = run_batch(df, plan, specs, mode, pick_mode,
                                                    client, workers)  # the parallel part
             except AuthError as exc:                # stop early on bad keys
                 st.error(f"{exc} Check your credentials file and host.")
@@ -907,8 +894,8 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
 #  7. App entry point
 # ══════════════════════════════════════════════════════════════════════════════
 def main() -> None:
-    st.set_page_config(page_title="LeadSquared Lens", page_icon="🔎", layout="wide")
-    st.title("🔎 LeadSquared Lens")
+    st.set_page_config(page_title="LeadSquared Field Fetcher", page_icon="🔎", layout="wide")
+    st.title("🔎 LeadSquared Field Fetcher")
 
     with st.sidebar:                                # connection + performance settings
         st.header("🔐 Connection")
