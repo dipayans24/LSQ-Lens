@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-#  LeadSquared Field Fetcher  –  Streamlit app
+# LSQ Lens  –  Streamlit app
 # ══════════════════════════════════════════════════════════════════════════════
 #  Install :  pip install -r requirements.txt
 #  Run     :  streamlit run lsq_field_fetcher.py
@@ -895,7 +895,7 @@ def render_fetch_panel(creds, workers, max_calls, show_raw) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def main() -> None:
     st.set_page_config(page_title="LeadSquared Field Fetcher", page_icon="🔎", layout="wide")
-    st.title("🔎 LeadSquared Field Fetcher")
+    st.title("🔎LSQ Lens")
 
     with st.sidebar:                                # connection + performance settings
         st.header("🔐 Connection")
